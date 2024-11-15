@@ -72,12 +72,12 @@ func SpanKindPredicate(kind trace.SpanKind) Predicate {
 
 func IsRootPredicate() Predicate {
 	return NewPredicate(func(params ComposableSamplingParameters) bool {
-		return params.ParentSpanContext.IsValid()
+		return params.ParentSpanContext().IsValid()
 	}, "root?")
 }
 
 func IsRemotePredicate() Predicate {
 	return NewPredicate(func(params ComposableSamplingParameters) bool {
-		return params.ParentSpanContext.IsValid() && params.ParentSpanContext.IsRemote()
+		return params.ParentSpanContext().IsValid() && params.ParentSpanContext().IsRemote()
 	}, "remote?")
 }

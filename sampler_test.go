@@ -8,7 +8,7 @@ import (
 
 func TestSamplerDescription(t *testing.T) {
 	type testCase struct {
-		sampler     ComposableSampler
+		sampler     interface{ Description() string }
 		description string
 	}
 
@@ -16,8 +16,8 @@ func TestSamplerDescription(t *testing.T) {
 		{AlwaysSample(), "AlwaysOn"},
 		{NeverSample(), "AlwaysOff"},
 		{RuleBased(
-			WithRule(SpanNamePredicate("/healthcheck"), NeverSample()),
-			WithDefaultRule(AlwaysSample()),
+			WithRule(SpanNamePredicate("/healthcheck"), ComposableNeverSample()),
+			WithDefaultRule(ComposableAlwaysSample()),
 		),
 			"RuleBased{rule(Span.Name==/healthcheck)=AlwaysOff,rule(true)=AlwaysOn}",
 		},

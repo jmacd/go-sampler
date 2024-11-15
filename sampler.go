@@ -1,17 +1,44 @@
 package sampler
 
+// List of all sampler instances:
+//
+//
+// ORIGINAL:
+//   TraceIdRatioBased
+//   AlwaysOn
+//   AlwaysOff
+//   ParentBased
+//
+// NEW:
+//   RuleBased
+//   AnyOf
+//   ParentThreshold
+//   Annotating
+//   ConsistentParentBased (a composition)
+//
+// ADAPTER:
+//   CompositeSampler (V2 -> V1)
+
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 )
 
-// V1 API
-
+// SamplingParameters is part of the original OTel-Go Sampling API.
+//
+// We should be aware that there are standing requests to extend it
+// with at least three more fields:
+// - SpanID: controversial because the spec says it's created after ShouldSample()
+// - Scope: controversial because it's a static property
+// - Resource: controversial because it's a static property
 type SamplingParameters struct {
 	ParentContext context.Context
 	TraceID       trace.TraceID
@@ -21,110 +48,122 @@ type SamplingParameters struct {
 	Links         []trace.Link
 }
 
+// Sampler is part of the original OTel-Go Sampling API.
+//
+// We refer to this API as non-compositional because it does not
+// separate its intentions from its side-effects.  This prototype
+// introduces "composable" forms of Sampler and SamplingParameters.
 type Sampler interface {
+	// ShouldSample is called prior to constructing a Span.
 	ShouldSample(SamplingParameters) SamplingResult
+
+	// Description is used when logging SDK configuration.
 	Description() string
 }
 
+// SamplingDecision is part of the original OTel-Go Sampling API.
 type SamplingDecision uint8
 
 const (
 	Drop SamplingDecision = iota
 	RecordOnly
+	ExportOnly // TODO: This is new. How can it be added in Go w/o breaking changes?
 	RecordAndSample
 )
 
+// SamplingResult is part of the original OTel-Go Sampling API.
+//
+// In this prototype, we aim to lower the cost of composite sampler
+// decisions by deferring the construction of attributes and tracestate
+// where the decision is combined from multiple samplers.
 type SamplingResult struct {
 	Decision   SamplingDecision
 	Attributes []attribute.KeyValue
 	Tracestate trace.TraceState
 }
 
-// Composable API
+// NEW PROTOTYPE BELOW
 
-type ComposableSamplingParameters struct {
-	SamplingParameters
-
-	// Note: ParentSpanContext == trace.SpanContextFromContext(p.ParentContext)
-	// this is an expensive call, so we compute it once in case multiple predicates
-	// need it.
-
-	ParentSpanContext trace.SpanContext
-
-	SpanID trace.SpanID
-
-	// not exported
-	parentThreshold uint64
-	traceRandomness uint64
-
-	// Missing:
-	// Resource
-	// Scope
-
+// SamplerOptimizer is an optional interface to optimize Samplers.
+type SamplerOptimizer interface {
+	Optimize(*resource.Resource, instrumentation.Scope) Sampler
 }
 
+// ComposableSamplerOptimizer is an optional interface to optimize ComposableSamplers.
+type ComposableSamplerOptimizer interface {
+	Optimize(*resource.Resource, instrumentation.Scope) ComposableSampler
+}
+
+// ComposableSamplingParameters extend SamplingParameters.
+//
+// Since this stands as a proposal to extend the OTel Sampling API, it
+// seems worth examining other standing feature requests.  Users would
+// like their Samplers to have access to Scope and Resource, which are
+// static properties, and the SpanID which the specification says not to
+// include.
+type ComposableSamplingParameters struct {
+	// SamplingParameters are the original API parameters.
+	SamplingParameters
+
+	// ParentSpanContext equals trace.SpanContextFromContext(p.ParentContext)
+	//
+	// This is an expensive call, so we compute it once in case
+	// multiple predicates will use it.
+	ParentSpanContext func() trace.SpanContext
+
+	// parentThreshold is only for use by the ParentThreshold
+	// sampler, thus not exported.  When there is no incoming
+	// threshold and sampled, initialize to INVALID_THRESHOLD,
+	// otherwise initialize to NEVER_SAMPLE_THRESHOLD when not
+	// sampled.
+	parentThreshold func() int64
+
+	// randomnessValue is provided for allowing composable
+	// samplers to differentiate between _they_ decided to sample
+	// and _anyone_ decided to sample.
+	randomnessValue func() int64
+
+	// TODO: SpanID is missing because the specification says it
+	// is, despite known use-cases.
+}
+
+// ComposableSampler is a sampler which separates its intentions from
+// its side-effects.
 type ComposableSampler interface {
+	// GetSamplingIntent returns the threshold at which this Sampler
+	// wishes to sample and functions that defer the side-effects of
+	// a positive decision.
 	GetSamplingIntent(ComposableSamplingParameters) SamplingIntent
+
+	// Description is used when logging SDK configuration.
 	Description() string
 }
 
+type AttributesFunc func() []attribute.KeyValue
+type TraceStateFunc func() trace.TraceState
+
+// SamplingIntent returns this sampler's intention.
 type SamplingIntent struct {
-	Record    bool   // whether to record
-	Export    bool   // whether to export, implies record
-	Threshold uint64 // i.e., sampling probability, implies record & export when...
+	Record    bool  // whether to record
+	Export    bool  // whether to export, implies record
+	Threshold int64 // i.e., sampling probability, implies record & export when...
 
 	Attributes AttributesFunc
+	TraceState TraceStateFunc
+}
 
-	// SampledTracestate AttributesFunc
-	// UnsampledTracestate func(trace.TraceState) trace.TraceState
+// WouldSample allows a ComposableSampler to conditionalize the attributes
+// they attach to the span based on whether a specific sampler decides to
+// sample, independent of the overall decision.
+func (in SamplingIntent) WouldSample(params ComposableSamplingParameters) bool {
+	return in.Threshold < params.randomnessValue()
 }
 
 // TraceIDRatioBased
-
-type traceIDRatio struct {
-	// threshold is a rejection threshold.
-	// Select when (T <= R)
-	// Drop when (T > R)
-	// Range is [0, 1<<56).
-	threshold   uint64
-	description string
-}
-
-const (
-	// DefaultSamplingPrecision is the number of hexadecimal
-	// digits of precision used to expressed the samplling probability.
-	defaultSamplingPrecision = 4
-
-	// MinSupportedProbability is the smallest probability that
-	// can be encoded by this implementation, and it defines the
-	// smallest interval between probabilities across the range.
-	// The largest supported probability is (1-MinSupportedProbability).
-	//
-	// This value corresponds with the size of a float64
-	// significand, because it simplifies this implementation to
-	// restrict the probability to use 52 bits (vs 56 bits).
-	minSupportedProbability float64 = 1 / float64(maxAdjustedCount)
-
-	// maxSupportedProbability is the number closest to 1.0 (i.e.,
-	// near 99.999999%) that is not equal to 1.0 in terms of the
-	// float64 representation, having 52 bits of significand.
-	// Other ways to express this number:
-	//
-	//   0x1.ffffffffffffe0p-01
-	//   0x0.fffffffffffff0p+00
-	//   math.Nextafter(1.0, 0.0)
-	maxSupportedProbability float64 = 1 - 0x1p-52
-
-	// maxAdjustedCount is the inverse of the smallest
-	// representable sampling probability, it is the number of
-	// distinct 56 bit values.
-	maxAdjustedCount uint64 = 1 << 56
-
-	// randomnessMask is a mask that selects the least-significant
-	// 56 bits of a uint64.
-	randomnessMask uint64 = maxAdjustedCount - 1
-)
-
+//
+// TraceIDRatioBased is the OTel-specified probabilistic sampler.
+//
+// TODO: Add support for variable precision?
 func TraceIDRatioBased(fraction float64) ComposableSampler {
 	const (
 		maxp  = 14                       // maximum precision is 56 bits
@@ -133,11 +172,11 @@ func TraceIDRatioBased(fraction float64) ComposableSampler {
 	)
 
 	if fraction > maxSupportedProbability {
-		return AlwaysSample()
+		return ComposableAlwaysSample()
 	}
 
 	if fraction < minSupportedProbability {
-		return NeverSample()
+		return ComposableNeverSample()
 	}
 
 	// Calculate the amount of precision needed to encode the
@@ -177,48 +216,71 @@ func TraceIDRatioBased(fraction float64) ComposableSampler {
 	}
 }
 
+type traceIDRatio struct {
+	// threshold is a rejection threshold.
+	// Select when (T <= R)
+	// Drop when (T > R)
+	// Range is [0, 1<<56).
+	threshold   uint64
+	description string
+}
+
+// Description implements ComposableSampler.
 func (ts *traceIDRatio) Description() string {
 	return ts.description
 }
 
+// GetSamplingIntent implements ComposableSampler.
 func (ts *traceIDRatio) GetSamplingIntent(p ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: ts.threshold,
+		Threshold: int64(ts.threshold),
 	}
 }
 
 // AlwaysOn
 
-func AlwaysSample() ComposableSampler {
+func AlwaysSample() Sampler {
+	return CompositeSampler(ComposableAlwaysSample())
+}
+
+func ComposableAlwaysSample() ComposableSampler {
 	return alwaysOn{}
 }
 
 type alwaysOn struct{}
 
+// GetSamplingIntent implements ComposableSampler.
 func (alwaysOn) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: 0,
+		Threshold: ALWAYS_SAMPLE_THRESHOLD,
 	}
 }
 
+// Description implements ComposableSampler.
 func (alwaysOn) Description() string {
 	return "AlwaysOn"
 }
 
 // AlwaysOff
 
-func NeverSample() ComposableSampler {
+func NeverSample() Sampler {
+	return CompositeSampler(ComposableNeverSample())
+}
+
+func ComposableNeverSample() ComposableSampler {
 	return alwaysOff{}
 }
 
 type alwaysOff struct{}
 
+// GetSamplingIntent implements ComposableSampler.
 func (alwaysOff) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: maxAdjustedCount,
+		Threshold: NEVER_SAMPLE_THRESHOLD,
 	}
 }
 
+// Description implements ComposableSampler.
 func (alwaysOff) Description() string {
 	return "AlwaysOff"
 }
@@ -251,6 +313,10 @@ type ruleBasedConfig struct {
 
 type ruleBased []ruleAndPredicate
 
+var _ ComposableSampler = &ruleBased{}
+var _ ComposableSamplerOptimizer = &ruleBased{}
+
+// Description implements ComposableSampler.
 func (rb ruleBased) Description() string {
 	return fmt.Sprintf("RuleBased{%s}",
 		strings.Join(func(rules []ruleAndPredicate) (desc []string) {
@@ -266,6 +332,7 @@ func (rb ruleBased) Description() string {
 		}(rb), ","))
 }
 
+// GetSamplingIntent implements ComposableSampler.
 func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
 	for _, rule := range rb {
 		if rule.Decide(params) {
@@ -276,7 +343,7 @@ func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) Sampl
 	// When no rules match.  This will not happen when there is a
 	// default rule set.
 	return SamplingIntent{
-		Threshold: maxAdjustedCount,
+		Threshold: NEVER_SAMPLE_THRESHOLD,
 	}
 }
 
@@ -295,23 +362,23 @@ func ParentThreshold() ComposableSampler {
 
 type parentThreshold struct{}
 
+var _ ComposableSampler = &parentThreshold{}
+
+// GetSamplingIntent implements ComposableSampler.
 func (parentThreshold) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
-	// @@@ problem? if the parent is a legacy, no threshold comes in.
-	// how does this decision get made?
 	return SamplingIntent{
-		Threshold: params.parentThreshold,
+		Threshold: params.parentThreshold(),
 	}
 }
 
+// Description implements ComposableSampler.
 func (parentThreshold) Description() string {
 	return "ParentThreshold"
 }
 
-// Annotating ("Marker")
+// Annotating (a.k.a. "Marker")
 
 type AnnotatingOption func(*annotatingConfig)
-
-type AttributesFunc func() []attribute.KeyValue
 
 type annotatingConfig struct {
 	attributes AttributesFunc
@@ -321,6 +388,9 @@ type annotatingSampler struct {
 	sampler    ComposableSampler
 	attributes AttributesFunc
 }
+
+var _ ComposableSampler = &annotatingSampler{}
+var _ ComposableSamplerOptimizer = &annotatingSampler{}
 
 func AnnotatingSampler(sampler ComposableSampler, options ...AnnotatingOption) ComposableSampler {
 	var config annotatingConfig
@@ -354,12 +424,126 @@ func WithSampledAttributes(af AttributesFunc) AnnotatingOption {
 	}
 }
 
+// GetSamplingIntent implements ComposableSampler.
 func (as annotatingSampler) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
 	intent := as.sampler.GetSamplingIntent(params)
+
+	// N.B.: We can make this conditional on whether this
+	// sampler's child decided to sample, vs any sampler decided
+	// to sample.
+	// if intent.WouldSample(params) {
+	//
+	// }
 	intent.Attributes = combineAttributesFunc(intent.Attributes, as.attributes)
+
 	return intent
 }
 
+// Description implements ComposableSampler.
 func (as annotatingSampler) Description() string {
 	return fmt.Sprintf("Annotating(%s)", as.sampler.Description())
+}
+
+// CompositeSampler construct a Sampler from a ComposableSampler.
+func CompositeSampler(s ComposableSampler) Sampler {
+	return &compositeSampler{
+		sampler: s,
+	}
+}
+
+type compositeSampler struct {
+	sampler ComposableSampler
+}
+
+var _ Sampler = &compositeSampler{}
+var _ SamplerOptimizer = &compositeSampler{}
+
+// ShouldSample implements Sampler.
+func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResult {
+
+	psc := newLazy(func() trace.SpanContext {
+		return trace.SpanContextFromContext(params.ParentContext)
+	})
+
+	otts := newLazy(func() string {
+		return psc.Value().TraceState().Get("ot")
+	})
+
+	threshold := newLazy(func() int64 {
+		if th, has := tracestateHasThreshold(otts.Value()); has {
+			return th
+		}
+		if psc.Value().IsSampled() {
+			return INVALID_THRESHOLD
+		}
+		return NEVER_SAMPLE_THRESHOLD
+	})
+
+	randomness := newLazy(func() int64 {
+		var hasRandom bool
+		var rnd uint64
+		if existOtts := otts.Value(); existOtts != "" {
+			// When the OTel trace state field exists, we will
+			// inspect for a "rv" and "th", otherwise assume that the
+			// TraceID is random.
+			rnd, hasRandom = tracestateHasRandomness(existOtts)
+		}
+		if !hasRandom {
+			// Interpret the least-significant 8-bytes as an
+			// unsigned number, then zero the top 8 bits using
+			// randomnessMask, yielding the least-significant 56
+			// bits of randomness, as specified in W3C Trace
+			// Context Level 2.
+			rnd = binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask
+		}
+		return int64(rnd)
+	})
+
+	intent := c.sampler.GetSamplingIntent(ComposableSamplingParameters{
+		SamplingParameters: params,
+		ParentSpanContext:  psc.Value,
+		parentThreshold:    threshold.Value,
+		randomnessValue:    randomness.Value,
+	})
+
+	// We only need to know the randomness when threshold is in a
+	// range where it matters.  Since this is used only once, no
+	// need for a sync.Once.
+	var sampled bool
+	switch {
+	case intent.Threshold == NEVER_SAMPLE_THRESHOLD:
+		sampled = false
+	case intent.Threshold <= ALWAYS_SAMPLE_THRESHOLD:
+		sampled = true
+	default:
+		sampled = intent.Threshold <= randomness.Value()
+	}
+
+	var decision SamplingDecision
+	var attrs []attribute.KeyValue
+
+	switch {
+	case sampled:
+		decision = RecordAndSample
+		attrs = intent.Attributes()
+	case intent.Export:
+		decision = ExportOnly
+		attrs = intent.Attributes()
+	case intent.Record:
+		decision = RecordOnly
+		attrs = intent.Attributes()
+	default:
+		decision = Drop
+	}
+
+	return SamplingResult{
+		Attributes: attrs,
+		Tracestate: intent.TraceState(),
+		Decision:   decision,
+	}
+}
+
+// Description implements ComposableSampler.
+func (c *compositeSampler) Description() string {
+	return c.sampler.Description()
 }
