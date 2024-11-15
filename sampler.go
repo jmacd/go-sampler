@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -11,7 +12,7 @@ import (
 
 // V1 API
 
-type SamplingParametersV1 struct {
+type SamplingParameters struct {
 	ParentContext context.Context
 	TraceID       trace.TraceID
 	Name          string
@@ -20,96 +21,65 @@ type SamplingParametersV1 struct {
 	Links         []trace.Link
 }
 
-type SamplerV1 interface {
-	ShouldSampleV1(SamplingParametersV1) SamplingResultV1
+type Sampler interface {
+	ShouldSample(SamplingParameters) SamplingResult
 	Description() string
 }
 
-type SamplingDecisionV1 uint8
+type SamplingDecision uint8
 
 const (
-	Drop SamplingDecisionV1 = iota
+	Drop SamplingDecision = iota
 	RecordOnly
 	RecordAndSample
 )
 
-type SamplingResultV1 struct {
-	Decision   SamplingDecisionV1
+type SamplingResult struct {
+	Decision   SamplingDecision
 	Attributes []attribute.KeyValue
 	Tracestate trace.TraceState
 }
 
-// V2 API
+// Composable API
 
-type SamplingParametersV2 struct {
-	SamplingParametersV1
+type ComposableSamplingParameters struct {
+	SamplingParameters
 
-	// Threshold  uint64
-	// Randomness uint64
+	// Note: ParentSpanContext == trace.SpanContextFromContext(p.ParentContext)
+	// this is an expensive call, so we compute it once in case multiple predicates
+	// need it.
+
+	ParentSpanContext trace.SpanContext
 
 	SpanID trace.SpanID
 
-	// NO:
+	// not exported
+	parentThreshold uint64
+	traceRandomness uint64
+
+	// Missing:
 	// Resource
 	// Scope
+
 }
 
-type SamplerV2 interface {
-	ShouldSampleV2(SamplingParametersV2) SamplingResultV2
+type ComposableSampler interface {
+	GetSamplingIntent(ComposableSamplingParameters) SamplingIntent
 	Description() string
 }
 
-type SamplingResultV2 struct {
-	Record     bool   // whether to record
-	Export     bool   // whether to export, implies record
-	Threshold  uint64 // i.e., probability, implies record & export when...
-	Attributes func([]attribute.KeyValue) []attribute.KeyValue
-	Tracestate func(trace.TraceState) trace.TraceState
+type SamplingIntent struct {
+	Record    bool   // whether to record
+	Export    bool   // whether to export, implies record
+	Threshold uint64 // i.e., sampling probability, implies record & export when...
+
+	Attributes AttributesFunc
+
+	// SampledTracestate AttributesFunc
+	// UnsampledTracestate func(trace.TraceState) trace.TraceState
 }
 
-// AlwaysOn V2
-
-type alwaysOn struct{}
-
-func AlwaysSample() SamplerV2 {
-	return alwaysOn{}
-}
-
-func (alwaysOn) ShouldSampleV2(SamplingParametersV2) SamplingResultV2 {
-	return SamplingResultV2{
-		Record:     true,
-		Export:     true,
-		Threshold:  0, // "0" means always sampled
-		Attributes: nil,
-		Tracestate: nil,
-	}
-}
-
-func (alwaysOn) Description() string {
-	return "AlwaysOn"
-}
-
-// AlwaysOff V2
-
-type alwaysOff struct{}
-
-func NeverSample() SamplerV2 {
-	return nil
-}
-
-func (alwaysOff) ShouldSampleV2(SamplingParametersV2) SamplingResultV2 {
-	return SamplingResultV2{
-		Record:    false,
-		Export:    false,
-		Threshold: maxAdjustedCount, // this threshold never samples
-	}
-}
-
-func (alwaysOff) Description() string {
-	return "AlwaysOff"
-}
-
-// TraceIDRatioBased V2
+// TraceIDRatioBased
 
 type traceIDRatio struct {
 	// threshold is a rejection threshold.
@@ -155,7 +125,7 @@ const (
 	randomnessMask uint64 = maxAdjustedCount - 1
 )
 
-func TraceIDRatioBased(fraction float64) SamplerV2 {
+func TraceIDRatioBased(fraction float64) ComposableSampler {
 	const (
 		maxp  = 14                       // maximum precision is 56 bits
 		defp  = defaultSamplingPrecision // default precision
@@ -211,115 +181,185 @@ func (ts *traceIDRatio) Description() string {
 	return ts.description
 }
 
-func (ts *traceIDRatio) ShouldSampleV2(p SamplingParametersV2) SamplingResultV2 {
-	return SamplingResultV2{
-		Export:    false,
-		Record:    false,
+func (ts *traceIDRatio) GetSamplingIntent(p ComposableSamplingParameters) SamplingIntent {
+	return SamplingIntent{
 		Threshold: ts.threshold,
 	}
 }
 
-// ParentBased V2
+// AlwaysOn
 
-type parentBased struct {
-	root, remoteYes, remoteNo, localYes, localNo SamplerV2
+func AlwaysSample() ComposableSampler {
+	return alwaysOn{}
 }
 
-func ParentBased(root SamplerV2, options ...ParentBasedSamplerOption) SamplerV2 {
-	pb := parentBased{
-		root:      root,
-		remoteYes: AlwaysSample(),
-		remoteNo:  NeverSample(),
-		localYes:  AlwaysSample(),
-		localNo:   NeverSample(),
+type alwaysOn struct{}
+
+func (alwaysOn) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
+	return SamplingIntent{
+		Threshold: 0,
 	}
+}
+
+func (alwaysOn) Description() string {
+	return "AlwaysOn"
+}
+
+// AlwaysOff
+
+func NeverSample() ComposableSampler {
+	return alwaysOff{}
+}
+
+type alwaysOff struct{}
+
+func (alwaysOff) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
+	return SamplingIntent{
+		Threshold: maxAdjustedCount,
+	}
+}
+
+func (alwaysOff) Description() string {
+	return "AlwaysOff"
+}
+
+// RuleBased
+
+func RuleBased(options ...RuleBasedOption) ComposableSampler {
+	rbc := &ruleBasedConfig{}
 	for _, opt := range options {
-		pb = opt.apply(pb)
+		opt(rbc)
 	}
-
-	return pb
+	if rbc.defRule != nil {
+		rbc.rules = append(rbc.rules, ruleAndPredicate{
+			Predicate:         TruePredicate(),
+			ComposableSampler: rbc.defRule,
+		})
+	}
+	return ruleBased(rbc.rules)
 }
 
-func (pb parentBased) ShouldSampleV2(p SamplingParametersV2) SamplingResultV2 {
-	psc := trace.SpanContextFromContext(p.ParentContext)
-	if psc.IsValid() {
-		if psc.IsRemote() {
-			if psc.IsSampled() {
-				return pb.remoteYes.ShouldSampleV2(p)
+type ruleAndPredicate struct {
+	Predicate
+	ComposableSampler
+}
+
+type ruleBasedConfig struct {
+	rules   []ruleAndPredicate
+	defRule ComposableSampler
+}
+
+type ruleBased []ruleAndPredicate
+
+func (rb ruleBased) Description() string {
+	return fmt.Sprintf("RuleBased{%s}",
+		strings.Join(func(rules []ruleAndPredicate) (desc []string) {
+			for _, rule := range rules {
+				desc = append(desc,
+					fmt.Sprintf("rule(%s)=%s",
+						rule.Predicate.Description(),
+						rule.ComposableSampler.Description(),
+					),
+				)
 			}
-			return pb.remoteNo.ShouldSampleV2(p)
-		}
-
-		if psc.IsSampled() {
-			return pb.localYes.ShouldSampleV2(p)
-		}
-		return pb.localNo.ShouldSampleV2(p)
-	}
-	return pb.root.ShouldSampleV2(p)
+			return
+		}(rb), ","))
 }
 
-func (pb parentBased) Description() string {
-	return fmt.Sprintf("ParentBased{root:%s,remoteParentSampled:%s,"+
-		"remoteParentNotSampled:%s,localParentSampled:%s,localParentNotSampled:%s}",
-		pb.root.Description(),
-		pb.remoteYes.Description(),
-		pb.remoteNo.Description(),
-		pb.localYes.Description(),
-		pb.localNo.Description(),
+func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
+	for _, rule := range rb {
+		if rule.Decide(params) {
+			return rule.ComposableSampler.GetSamplingIntent(params)
+		}
+	}
+
+	// When no rules match.  This will not happen when there is a
+	// default rule set.
+	return SamplingIntent{
+		Threshold: maxAdjustedCount,
+	}
+}
+
+// ConsistentParentBased combines a root sampler and a ParentThreshold.
+func ConsistentParentBased(root ComposableSampler) ComposableSampler {
+	return RuleBased(
+		WithRule(IsRootPredicate(), root),
+		WithDefaultRule(ParentThreshold()),
 	)
 }
 
-// ParentBasedSamplerOption configures the sampler for a particular sampling case.
-type ParentBasedSamplerOption interface {
-	apply(parentBased) parentBased
+// ParentThreshold may be composed to form consistent parent-based sampling.
+func ParentThreshold() ComposableSampler {
+	return parentThreshold{}
 }
 
-// WithRemoteParentSampled sets the sampler for the case of sampled remote parent.
-func WithRemoteParentSampled(s SamplerV2) ParentBasedSamplerOption {
-	return remoteParentSampledOption{s}
+type parentThreshold struct{}
+
+func (parentThreshold) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
+	// @@@ problem? if the parent is a legacy, no threshold comes in.
+	// how does this decision get made?
+	return SamplingIntent{
+		Threshold: params.parentThreshold,
+	}
 }
 
-type remoteParentSampledOption struct{ SamplerV2 }
-
-func (o remoteParentSampledOption) apply(sampler parentBased) parentBased {
-	sampler.remoteYes = o.SamplerV2
-	return sampler
+func (parentThreshold) Description() string {
+	return "ParentThreshold"
 }
 
-// WithRemoteParentNotSampled sets the sampler for the case of remote parent
-// which is not sampled.
-func WithRemoteParentNotSampled(s SamplerV2) ParentBasedSamplerOption {
-	return remoteParentNotSampledOption{s}
+// Annotating ("Marker")
+
+type AnnotatingOption func(*annotatingConfig)
+
+type AttributesFunc func() []attribute.KeyValue
+
+type annotatingConfig struct {
+	attributes AttributesFunc
 }
 
-type remoteParentNotSampledOption struct{ SamplerV2 }
-
-func (o remoteParentNotSampledOption) apply(sampler parentBased) parentBased {
-	sampler.remoteNo = o.SamplerV2
-	return sampler
+type annotatingSampler struct {
+	sampler    ComposableSampler
+	attributes AttributesFunc
 }
 
-// WithLocalParentSampled sets the sampler for the case of sampled local parent.
-func WithLocalParentSampled(s SamplerV2) ParentBasedSamplerOption {
-	return localParentSampledOption{s}
+func AnnotatingSampler(sampler ComposableSampler, options ...AnnotatingOption) ComposableSampler {
+	var config annotatingConfig
+	for _, opt := range options {
+		opt(&config)
+	}
+	return &annotatingSampler{
+		sampler:    sampler,
+		attributes: config.attributes,
+	}
 }
 
-type localParentSampledOption struct{ SamplerV2 }
-
-func (o localParentSampledOption) apply(sampler parentBased) parentBased {
-	sampler.localYes = o.SamplerV2
-	return sampler
+func combineAttributesFunc(one, two AttributesFunc) AttributesFunc {
+	return func() []attribute.KeyValue {
+		if one == nil && two == nil {
+			return nil
+		}
+		if one == nil {
+			return two()
+		}
+		if two == nil {
+			return one()
+		}
+		return append(one(), two()...)
+	}
 }
 
-// WithLocalParentNotSampled sets the sampler for the case of local parent
-// which is not sampled.
-func WithLocalParentNotSampled(s SamplerV2) ParentBasedSamplerOption {
-	return localParentNotSampledOption{s}
+func WithSampledAttributes(af AttributesFunc) AnnotatingOption {
+	return func(cfg *annotatingConfig) {
+		cfg.attributes = combineAttributesFunc(cfg.attributes, af)
+	}
 }
 
-type localParentNotSampledOption struct{ SamplerV2 }
+func (as annotatingSampler) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
+	intent := as.sampler.GetSamplingIntent(params)
+	intent.Attributes = combineAttributesFunc(intent.Attributes, as.attributes)
+	return intent
+}
 
-func (o localParentNotSampledOption) apply(sampler parentBased) parentBased {
-	sampler.localNo = o.SamplerV2
-	return sampler
+func (as annotatingSampler) Description() string {
+	return fmt.Sprintf("Annotating(%s)", as.sampler.Description())
 }
