@@ -1,10 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
-
 package sampler
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -12,6 +12,16 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+var testAttrs = []attribute.KeyValue{attribute.String("K", "V")}
+
+var testTs = func() trace.TraceState {
+	ts, err := trace.ParseTraceState("tsk1=tsv,tsk2=tsv")
+	if err != nil {
+		panic(err)
+	}
+	return ts
+}()
 
 func TestSamplerDescription(t *testing.T) {
 	type testCase struct {
@@ -44,12 +54,60 @@ func TestSamplerDescription(t *testing.T) {
 	}
 }
 
+func TestAlwaysSample(t *testing.T) {
+	for _, sampler := range []Sampler{
+		AlwaysSample(),
+		CompositeSampler(ComposableAlwaysSample()),
+	} {
+		t.Run(fmt.Sprintf("%T", sampler), func(t *testing.T) {
+			test := defaultTestFuncs()
+			test.tracestate = func() trace.TraceState {
+				return testTs
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+			params := makeTestContext(test).SamplingParameters
+			sampler := AlwaysSample()
+
+			result := sampler.ShouldSample(params)
+			require.Equal(t, RecordAndSample, result.Decision)
+			require.Empty(t, result.Attributes)
+			require.Equal(t, testTs, result.Tracestate)
+		})
+	}
+}
+
+func TestParentBased(t *testing.T) {
+	// for _, sampler := range []Sampler{
+	// 	AlwaysSample(),
+	// 	CompositeSampler(ComposableAlwaysSample()),
+	// } {
+	// 	t.Run(fmt.Sprintf("%T", sampler), func(t *testing.T) {
+	// 		test := defaultTestFuncs()
+	// 		test.tracestate = func() trace.TraceState {
+	// 			return testTs
+	// 		}
+	// 		test.attributes = func() []attribute.KeyValue {
+	// 			return testAttrs
+	// 		}
+	// 		params := makeTestContext(test).SamplingParameters
+	// 		sampler := AlwaysSample()
+
+	// 		result := sampler.ShouldSample(params)
+	// 		require.Equal(t, RecordAndSample, result.Decision)
+	// 		require.Empty(t, result.Attributes)
+	// 		require.Equal(t, testTs, result.Tracestate)
+	// 	})
+	// }
+}
+
 type testContext struct {
 	context.Context
 	SamplingParameters
 }
 
-type benchFuncs struct {
+type testFuncs struct {
 	sampled    func() bool
 	remote     func() bool
 	tracestate func() trace.TraceState
@@ -59,14 +117,16 @@ type benchFuncs struct {
 	links      func() []trace.Link
 }
 
+const maxContexts = 10000
+
 func makeBenchContexts(
 	n int,
-	bfuncs benchFuncs,
+	bfuncs testFuncs,
 ) (
 	r []testContext,
 ) {
 	randSource := rand.New(rand.NewSource(101333))
-	for range n {
+	for range max(n, maxContexts) {
 		var cfg trace.SpanContextConfig
 		randSource.Read(cfg.TraceID[:])
 		randSource.Read(cfg.SpanID[:])
@@ -96,8 +156,8 @@ func makeBenchContexts(
 	return
 }
 
-func defaultBenchFuncs() benchFuncs {
-	return benchFuncs{
+func defaultTestFuncs() testFuncs {
+	return testFuncs{
 		sampled: func() bool { return true },
 		remote:  func() bool { return true },
 		tracestate: func() trace.TraceState {
@@ -112,7 +172,29 @@ func defaultBenchFuncs() benchFuncs {
 }
 
 func makeSimpleContexts(n int) []testContext {
-	return makeBenchContexts(n, defaultBenchFuncs())
+	return makeBenchContexts(n, defaultTestFuncs())
+}
+
+func makeTestContext(bf testFuncs) testContext {
+	return makeBenchContexts(1, bf)[0]
+}
+
+func BenchmarkAlwaysOn(b *testing.B) {
+	ctxs := makeSimpleContexts(b.N)
+	sampler := AlwaysSample()
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkConsistentAlwaysOn(b *testing.B) {
+	ctxs := makeSimpleContexts(b.N)
+	sampler := CompositeSampler(ComposableAlwaysSample())
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
 }
 
 func BenchmarkConsistentParentBased(b *testing.B) {
@@ -120,6 +202,66 @@ func BenchmarkConsistentParentBased(b *testing.B) {
 	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
 	b.ResetTimer()
 	for i := range b.N {
-		_ = sampler.ShouldSample(ctxs[i].SamplingParameters)
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkConsistentParentBasedWithNonEmptyTraceState(b *testing.B) {
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir")
+		require.NoError(b, err)
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkConsistentParentBasedWithNonEmptyOTelTraceState(b *testing.B) {
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def")
+		require.NoError(b, err)
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkConsistentParentBasedWithNonEmptyOTelTraceStateIncludingRandomness(b *testing.B) {
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;rv:abcdefabcdefab")
+		require.NoError(b, err)
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkParentBasedWithOTelTraceStateIncludingRandomness(b *testing.B) {
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;rv:abcdefabcdefab")
+		require.NoError(b, err)
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := ParentBased(AlwaysSample())
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
 	}
 }

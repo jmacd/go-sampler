@@ -127,18 +127,31 @@ func combineTracestate(original trace.TraceState, updateThreshold int64) trace.T
 		}
 		out.WriteString(toWrite)
 	}
-	if updateThreshold >= 0 {
-		if out.Len() != 0 {
-			out.WriteString(";th:")
-		} else {
-			out.WriteString("th:")
+	var returnTracestate trace.TraceState
+	var err error
+	if updateThreshold == 0 && out.Len() == 0 {
+		// Fast-path for ConsistentAlwaysOn w/ empty TraceState
+		returnTracestate, err = original.Insert("ot", "th:0")
+	} else {
+		// Slower path: write "th:T_VALUE"
+		if updateThreshold >= 0 {
+			// Add the optional separator and threshold sub-key
+			if out.Len() != 0 {
+				out.WriteString(";th:")
+			} else {
+				out.WriteString("th:")
+			}
+			if updateThreshold == 0 {
+				// Special case is required, otherwise the TrimRight() below
+				// would leave an empty string.
+				out.WriteString("0")
+			} else {
+				// Format as an unsigned integer and remove trailing zeros.
+				out.WriteString(strings.TrimRight(strconv.FormatUint(uint64(updateThreshold), 16), "0"))
+			}
 		}
-		if updateThreshold == 0 {
-			out.WriteString("0")
-		}
-		out.WriteString(strings.TrimRight(strconv.FormatUint(uint64(updateThreshold), 16), "0"))
+		returnTracestate, err = original.Insert("ot", out.String())
 	}
-	returnTracestate, err := original.Insert("ot", out.String())
 	if err != nil {
 		otel.Handle(fmt.Errorf("could not update tracestate with threshold: %w", err))
 	}

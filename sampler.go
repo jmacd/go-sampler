@@ -83,6 +83,12 @@ type SamplingResult struct {
 	Decision   SamplingDecision
 	Attributes []attribute.KeyValue
 	Tracestate trace.TraceState
+
+	// Note: The experimental ExportOnly feature explored in this
+	// package indicates the need for a new result of some sort.
+	// The export-only span has to encode its sampling threshold
+	// without propagating the threshold into the context.  This could
+	// be accomplished through _two_ tracestate returns?
 }
 
 // NEW PROTOTYPE BELOW
@@ -119,15 +125,12 @@ type ComposableSamplingParameters struct {
 	// threshold and sampled, initialize to INVALID_THRESHOLD,
 	// otherwise initialize to NEVER_SAMPLE_THRESHOLD when not
 	// sampled.
-	parentThreshold func() int64
+	parentThreshold int64
 
 	// randomnessValue is provided for allowing composable
 	// samplers to differentiate between _they_ decided to sample
 	// and _anyone_ decided to sample.
-	randomnessValue func() int64
-
-	// TODO: SpanID is missing because the specification says it
-	// is, despite known use-cases.
+	randomnessValue int64
 }
 
 // ComposableSampler is a sampler which separates its intentions from
@@ -159,7 +162,7 @@ type SamplingIntent struct {
 // they attach to the span based on whether a specific sampler decides to
 // sample, independent of the overall decision.
 func (in SamplingIntent) WouldSample(params ComposableSamplingParameters) bool {
-	return in.Threshold < params.randomnessValue()
+	return in.Threshold < params.randomnessValue
 }
 
 // TraceIDRatioBased
@@ -240,27 +243,46 @@ func (ts *traceIDRatio) GetSamplingIntent(p ComposableSamplingParameters) Sampli
 	}
 }
 
-// AlwaysOn
-
+// AlwaysOn is could be defined as:
+//
+//	CompositeSampler(ComposableAlwaysSample())
+//
+// and this is defined so we can measure the abstraction cost.
 func AlwaysSample() Sampler {
-	return CompositeSampler(ComposableAlwaysSample())
-}
-
-func ComposableAlwaysSample() ComposableSampler {
 	return alwaysOn{}
 }
 
 type alwaysOn struct{}
 
+func (alwaysOn) ShouldSample(params SamplingParameters) SamplingResult {
+	return SamplingResult{
+		Decision:   RecordAndSample,
+		Tracestate: trace.SpanContextFromContext(params.ParentContext).TraceState(),
+	}
+}
+
+// Description implements ComposableSampler.
+func (alwaysOn) Description() string {
+	return "AlwaysOn"
+}
+
+// ComposableAlwaysOn
+
+func ComposableAlwaysSample() ComposableSampler {
+	return cAlwaysOn{}
+}
+
+type cAlwaysOn struct{}
+
 // GetSamplingIntent implements ComposableSampler.
-func (alwaysOn) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
+func (cAlwaysOn) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
 		Threshold: ALWAYS_SAMPLE_THRESHOLD,
 	}
 }
 
 // Description implements ComposableSampler.
-func (alwaysOn) Description() string {
+func (cAlwaysOn) Description() string {
 	return "AlwaysOn"
 }
 
@@ -370,7 +392,7 @@ var _ ComposableSampler = &parentThreshold{}
 // GetSamplingIntent implements ComposableSampler.
 func (parentThreshold) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: params.parentThreshold(),
+		Threshold: params.parentThreshold,
 	}
 }
 
@@ -463,45 +485,53 @@ var _ SamplerOptimizer = &compositeSampler{}
 
 // ShouldSample implements Sampler.
 func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResult {
+	// Note: I experimented with making the steps below be lazy,
+	// since not all Sampler configurations will use the result,
+	// by using sync.Once and a func().  This isn't worthwhile
+	// because the additional allocations counteract the savings:
+	// - trace.SpanContextFromContext
+	// - TraceState().Get("ot")
+	// - tracestateHasThreshold()
+	// - tracestateHasRandomness()
+	// In benchmarking, it's substantially faster to just run
+	// through these calls w/o allocations.
 
 	psc := trace.SpanContextFromContext(params.ParentContext)
 
 	otts := psc.TraceState().Get("ot")
 
 	var threshold int64
-	if th, has := tracestateHasThreshold(otts); has {
-		threshold = th
+	var hasThreshold bool
+	if threshold, hasThreshold = tracestateHasThreshold(otts); hasThreshold {
+		// OK!
 	} else if psc.IsSampled() {
 		threshold = INVALID_THRESHOLD
 	} else {
 		threshold = NEVER_SAMPLE_THRESHOLD
 	}
 
-	randomness := newLazy(func() int64 {
-		var hasRandom bool
-		var rnd int64
-		if otts != "" {
-			// When the OTel trace state field exists, we will
-			// inspect for a "rv" and "th", otherwise assume that the
-			// TraceID is random.
-			rnd, hasRandom = tracestateHasRandomness(otts)
-		}
-		if !hasRandom {
-			// Interpret the least-significant 8-bytes as an
-			// unsigned number, then zero the top 8 bits using
-			// randomnessMask, yielding the least-significant 56
-			// bits of randomness, as specified in W3C Trace
-			// Context Level 2.
-			rnd = int64(binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask)
-		}
-		return int64(rnd)
-	})
+	var hasRandom bool
+	var rnd int64
+	if otts != "" {
+		// When the OTel trace state field exists, we will
+		// inspect for a "rv" and "th", otherwise assume that the
+		// TraceID is random.
+		rnd, hasRandom = tracestateHasRandomness(otts)
+	}
+	if !hasRandom {
+		// Interpret the least-significant 8-bytes as an
+		// unsigned number, then zero the top 8 bits using
+		// randomnessMask, yielding the least-significant 56
+		// bits of randomness, as specified in W3C Trace
+		// Context Level 2.
+		rnd = int64(binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask)
+	}
 
 	intent := c.sampler.GetSamplingIntent(ComposableSamplingParameters{
 		SamplingParameters: params,
 		ParentSpanContext:  psc,
-		parentThreshold:    threshold.Value,
-		randomnessValue:    randomness.Value,
+		parentThreshold:    threshold,
+		randomnessValue:    rnd,
 	})
 
 	// We only need to know the randomness when threshold is in a
@@ -514,7 +544,7 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	case intent.Threshold <= ALWAYS_SAMPLE_THRESHOLD:
 		sampled = true
 	default:
-		sampled = intent.Threshold <= randomness.Value()
+		sampled = intent.Threshold <= rnd
 	}
 
 	var decision SamplingDecision
@@ -538,13 +568,21 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		if intent.Attributes != nil {
 			attrs = intent.Attributes()
 		}
-		returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+		if intent.Threshold != threshold {
+			returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+		}
 	case intent.Export:
+		// Note: this is a study in what it would take to update the sampling
+		// API to support export-only sampling decisions.  In this case, we still
+		// have a well-defined threshold and want to use it, but we do not want
+		// it to propagate to the context.
 		decision = ExportOnly
 		if intent.Attributes != nil {
 			attrs = intent.Attributes()
 		}
-		returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+		if intent.Threshold != threshold {
+			returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+		}
 	case intent.Record:
 		decision = RecordOnly
 		attrs = intent.Attributes()
