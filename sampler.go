@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package sampler
 
 // List of all sampler instances:
@@ -109,7 +112,7 @@ type ComposableSamplingParameters struct {
 	//
 	// This is an expensive call, so we compute it once in case
 	// multiple predicates will use it.
-	ParentSpanContext func() trace.SpanContext
+	ParentSpanContext trace.SpanContext
 
 	// parentThreshold is only for use by the ParentThreshold
 	// sampler, thus not exported.  When there is no incoming
@@ -461,19 +464,15 @@ var _ SamplerOptimizer = &compositeSampler{}
 // ShouldSample implements Sampler.
 func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResult {
 
-	psc := newLazy(func() trace.SpanContext {
-		return trace.SpanContextFromContext(params.ParentContext)
-	})
+	psc := trace.SpanContextFromContext(params.ParentContext)
 
-	otts := newLazy(func() string {
-		return psc.Value().TraceState().Get("ot")
-	})
+	otts := psc.TraceState().Get("ot")
 
 	threshold := newLazy(func() int64 {
-		if th, has := tracestateHasThreshold(otts.Value()); has {
+		if th, has := tracestateHasThreshold(otts); has {
 			return th
 		}
-		if psc.Value().IsSampled() {
+		if psc.IsSampled() {
 			return INVALID_THRESHOLD
 		}
 		return NEVER_SAMPLE_THRESHOLD
@@ -481,12 +480,12 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 
 	randomness := newLazy(func() int64 {
 		var hasRandom bool
-		var rnd uint64
-		if existOtts := otts.Value(); existOtts != "" {
+		var rnd int64
+		if otts != "" {
 			// When the OTel trace state field exists, we will
 			// inspect for a "rv" and "th", otherwise assume that the
 			// TraceID is random.
-			rnd, hasRandom = tracestateHasRandomness(existOtts)
+			rnd, hasRandom = tracestateHasRandomness(otts)
 		}
 		if !hasRandom {
 			// Interpret the least-significant 8-bytes as an
@@ -494,14 +493,14 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 			// randomnessMask, yielding the least-significant 56
 			// bits of randomness, as specified in W3C Trace
 			// Context Level 2.
-			rnd = binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask
+			rnd = int64(binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask)
 		}
 		return int64(rnd)
 	})
 
 	intent := c.sampler.GetSamplingIntent(ComposableSamplingParameters{
 		SamplingParameters: params,
-		ParentSpanContext:  psc.Value,
+		ParentSpanContext:  psc,
 		parentThreshold:    threshold.Value,
 		randomnessValue:    randomness.Value,
 	})
@@ -522,13 +521,31 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	var decision SamplingDecision
 	var attrs []attribute.KeyValue
 
+	// Note `otts` contains the original value for the `ot=`
+	// field.  However, Samplers have a right to modify the ot=
+	// field, especially in case they are the one to set the `rv:`
+	// subfield.  Therefore, do not use `otts.Value()` in the
+	// combineTracestate functions below.
+	var returnTracestate trace.TraceState
+	if intent.TraceState != nil {
+		returnTracestate = intent.TraceState()
+	} else {
+		returnTracestate = psc.TraceState()
+	}
+
 	switch {
 	case sampled:
 		decision = RecordAndSample
-		attrs = intent.Attributes()
+		if intent.Attributes != nil {
+			attrs = intent.Attributes()
+		}
+		returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
 	case intent.Export:
 		decision = ExportOnly
-		attrs = intent.Attributes()
+		if intent.Attributes != nil {
+			attrs = intent.Attributes()
+		}
+		returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
 	case intent.Record:
 		decision = RecordOnly
 		attrs = intent.Attributes()
@@ -538,7 +555,7 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 
 	return SamplingResult{
 		Attributes: attrs,
-		Tracestate: intent.TraceState(),
+		Tracestate: returnTracestate,
 		Decision:   decision,
 	}
 }

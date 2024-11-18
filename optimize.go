@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package sampler
 
 import (
@@ -30,6 +33,10 @@ func (as *annotatingSampler) Optimize(res *resource.Resource, scope instrumentat
 func (rb ruleBased) Optimize(res *resource.Resource, scope instrumentation.Scope) ComposableSampler {
 	var opt []ruleAndPredicate
 	for _, rule := range rb {
+		// TODO: Here, what's next?
+		// if rule.Predicate.Optimize(res, scope)
+		// Note that there is even more potential missed, e.g.,
+		// ability to optimize on span.Kind or really any conjunct.
 		opt = append(opt, ruleAndPredicate{
 			Predicate:         rule.Predicate,
 			ComposableSampler: optimize2(rule.ComposableSampler, res, scope),

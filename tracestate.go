@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package sampler
 
 import (
@@ -6,6 +9,7 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // fieldSearchKey is a two-character OpenTelemetry tracestate field name
@@ -71,56 +75,72 @@ func tracestateHasThreshold(otts string) (int64, bool) {
 
 // combineTracestate combines an existing OTel tracestate fragment,
 // which is the value of a top-level "ot" tracestate vendor tag.
-func combineTracestate(incoming, updated string) string {
-	// `incoming` is formatted according to the OTel tracestate
-	// spec, with colon separating two-byte key and value, with
-	// semi-colon separating key-value pairs.
-	//
-	// `updated` should be a single two-byte key:value to modify
-	// or insert therefore colonOffset is 2 bytes, valueOffset is
-	// 3 bytes into `incoming`.
-	const colonOffset = 2
-	const valueOffset = colonOffset + 1
-
-	if incoming == "" {
-		return updated
+func combineTracestate(original trace.TraceState, updateThreshold int64) trace.TraceState {
+	// There's nothing to do when original is empty and so is the new threshold.
+	if original.Len() == 0 && updateThreshold < 0 {
+		return original
 	}
+
+	unmodified := original.Get("ot")
+	incoming := unmodified
+
 	var out strings.Builder
 
-	// The update is expected to be a single key-value of the form
-	// `XX:value` for with two-character key.
-	upkey := updated[:colonOffset]
+	// This loop body copies the OpenTelemetry tracestate value
+	// while erasing the incoming threshold.
+	for len(incoming) != 0 {
+		cpos := strings.IndexByte(incoming, ':')
 
-	// In this case, there is an existing field under "ot" and we
-	// need to combine.  We will pass the parts of "incoming"
-	// through except the field we are updating, which we will
-	// modify if it is found.
-	foundUp := false
-
-	for count := 0; len(incoming) != 0; count++ {
-		key, rest, hasCol := strings.Cut(incoming, ":")
-		if !hasCol {
-			// return the updated value, ignore invalid inputs
-			return updated
+		if cpos < 0 {
+			// Awkward situation: we can't parse the
+			// tracestate we're meant to modify.  Handle
+			// an error and erase the entry entirely.
+			otel.Handle(fmt.Errorf("cannot update invalid tracestate: %s", unmodified))
+			return original.Delete("ot")
 		}
-		value, next, _ := strings.Cut(rest, ";")
 
-		if key == upkey {
-			value = updated[valueOffset:]
-			foundUp = true
+		// Note: There are a few loose ends here related to
+		// whitespace handling.  At the risk of unnecessary
+		// code complexity, probably OTel's tracestate
+		// specification should declare e.g., leading
+		// whitespace invalid.
+		thisKey := incoming[:cpos]
+		toWrite := incoming
+
+		if spos := strings.IndexByte(incoming[cpos+1:], ';'); spos < 0 {
+			// This is the final pair.
+			incoming = ""
+			toWrite = incoming
+		} else {
+			// Note that the semicolon is not included in toWrite
+			// but it is skipped in incoming, the difference is 1.
+			split := cpos + spos + 1
+			toWrite = incoming[:split]
+			incoming = incoming[split+1:]
 		}
-		if count != 0 {
+		if thisKey == "th" {
+			// Skip the incoming th value.
+			continue
+		}
+		if out.Len() != 0 {
 			out.WriteString(";")
 		}
-		out.WriteString(key)
-		out.WriteString(":")
-		out.WriteString(value)
-
-		incoming = next
+		out.WriteString(toWrite)
 	}
-	if !foundUp {
-		out.WriteString(";")
-		out.WriteString(updated)
+	if updateThreshold >= 0 {
+		if out.Len() != 0 {
+			out.WriteString(";th:")
+		} else {
+			out.WriteString("th:")
+		}
+		if updateThreshold == 0 {
+			out.WriteString("0")
+		}
+		out.WriteString(strings.TrimRight(strconv.FormatUint(uint64(updateThreshold), 16), "0"))
 	}
-	return out.String()
+	returnTracestate, err := original.Insert("ot", out.String())
+	if err != nil {
+		otel.Handle(fmt.Errorf("could not update tracestate with threshold: %w", err))
+	}
+	return returnTracestate
 }
