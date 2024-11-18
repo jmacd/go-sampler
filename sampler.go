@@ -468,15 +468,14 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 
 	otts := psc.TraceState().Get("ot")
 
-	threshold := newLazy(func() int64 {
-		if th, has := tracestateHasThreshold(otts); has {
-			return th
-		}
-		if psc.IsSampled() {
-			return INVALID_THRESHOLD
-		}
-		return NEVER_SAMPLE_THRESHOLD
-	})
+	var threshold int64
+	if th, has := tracestateHasThreshold(otts); has {
+		threshold = th
+	} else if psc.IsSampled() {
+		threshold = INVALID_THRESHOLD
+	} else {
+		threshold = NEVER_SAMPLE_THRESHOLD
+	}
 
 	randomness := newLazy(func() int64 {
 		var hasRandom bool
