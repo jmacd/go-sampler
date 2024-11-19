@@ -29,6 +29,7 @@ import (
 	"math"
 	"strings"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -130,6 +131,9 @@ type ComposableSamplingParameters struct {
 	// randomnessValue is provided for allowing composable
 	// samplers to differentiate between _they_ decided to sample
 	// and _anyone_ decided to sample.
+	//
+	// Note: this doesn't really work if sampler is able to
+	// modify the RV.
 	randomnessValue int64
 }
 
@@ -146,16 +150,13 @@ type ComposableSampler interface {
 }
 
 type AttributesFunc func() []attribute.KeyValue
-type TraceStateFunc func() trace.TraceState
 
 // SamplingIntent returns this sampler's intention.
 type SamplingIntent struct {
-	Record    bool  // whether to record
-	Export    bool  // whether to export, implies record
-	Threshold int64 // i.e., sampling probability, implies record & export when...
-
+	Record     bool  // whether to record
+	Export     bool  // whether to export, implies record
+	Threshold  int64 // i.e., sampling probability, implies record & export when...
 	Attributes AttributesFunc
-	TraceState TraceStateFunc
 }
 
 // WouldSample allows a ComposableSampler to conditionalize the attributes
@@ -497,16 +498,16 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	// through these calls w/o allocations.
 
 	psc := trace.SpanContextFromContext(params.ParentContext)
+	returnTracestate := psc.TraceState()
+	otts := returnTracestate.Get("ot")
 
-	otts := psc.TraceState().Get("ot")
+	threshold, saveThresholdPos, hasThreshold := tracestateHasThreshold(otts)
 
-	var threshold int64
-	var hasThreshold bool
-	if threshold, hasThreshold = tracestateHasThreshold(otts); hasThreshold {
-		// OK!
-	} else if psc.IsSampled() {
+	switch {
+	case hasThreshold:
+	case psc.IsSampled():
 		threshold = INVALID_THRESHOLD
-	} else {
+	default:
 		threshold = NEVER_SAMPLE_THRESHOLD
 	}
 
@@ -549,19 +550,7 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 
 	var decision SamplingDecision
 	var attrs []attribute.KeyValue
-
-	// Note `otts` contains the original value for the `ot=`
-	// field.  However, Samplers have a right to modify the ot=
-	// field, especially in case they are the one to set the `rv:`
-	// subfield.  Therefore, do not use `otts.Value()` in the
-	// combineTracestate functions below.
-	var returnTracestate trace.TraceState
-	if intent.TraceState != nil {
-		returnTracestate = intent.TraceState()
-	} else {
-		returnTracestate = psc.TraceState()
-	}
-
+	var err error
 	switch {
 	case sampled:
 		decision = RecordAndSample
@@ -569,7 +558,7 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 			attrs = intent.Attributes()
 		}
 		if intent.Threshold != threshold {
-			returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
 		}
 	case intent.Export:
 		// Note: this is a study in what it would take to update the sampling
@@ -581,13 +570,16 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 			attrs = intent.Attributes()
 		}
 		if intent.Threshold != threshold {
-			returnTracestate = combineTracestate(returnTracestate, intent.Threshold)
+			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
 		}
 	case intent.Record:
 		decision = RecordOnly
 		attrs = intent.Attributes()
 	default:
 		decision = Drop
+	}
+	if err != nil {
+		otel.Handle(fmt.Errorf("tracestate: %w", err))
 	}
 
 	return SamplingResult{
