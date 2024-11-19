@@ -46,7 +46,7 @@ func TestSamplerDescription(t *testing.T) {
 			"RuleBased{rule(Span.Name==/healthcheck)=AlwaysOff,rule(true)=AlwaysOn}",
 		},
 		{
-			ConsistentParentBased(ComposableAlwaysSample()),
+			ComposableParentBased(ComposableAlwaysSample()),
 			"RuleBased{rule(root?)=AlwaysOn,rule(true)=ParentThreshold}",
 		},
 	} {
@@ -54,12 +54,37 @@ func TestSamplerDescription(t *testing.T) {
 	}
 }
 
-func TestAlwaysSample(t *testing.T) {
-	for _, sampler := range []Sampler{
-		AlwaysSample(),
-		CompositeSampler(ComposableAlwaysSample()),
+type samplerAnd[T any] struct {
+	sampler Sampler
+	data    T
+}
+
+func (sand samplerAnd[T]) name() string {
+	return fmt.Sprintf("%T:%v:%v", sand.sampler, sand.sampler.Description(), sand.data)
+}
+
+type samplerAnd2[T1 any, T2 any] struct {
+	sampler Sampler
+	data1   T1
+	data2   T2
+}
+
+func (sand samplerAnd2[T1, T2]) name() string {
+	return fmt.Sprintf("%T:%v:%v:%v", sand.sampler, sand.sampler.Description(), sand.data1, sand.data2)
+}
+
+// TestChildSpanUnknownThresholdSampled tests a sampled child span
+// sampled context w/o tracestate.  All will sample this span.  The
+// boolean indicates whether the threshold is output.  Only the
+// consistent always-on case will restore a known threshold.
+func TestChildSpanUnknownThresholdSampled(t *testing.T) {
+	for _, sand := range []samplerAnd[bool]{
+		{AlwaysSample(), false},
+		{CompositeSampler(ComposableAlwaysSample()), true},
+		{ParentBased(AlwaysSample()), false},
+		{CompositeSampler(ComposableParentBased(ComposableAlwaysSample())), false},
 	} {
-		t.Run(fmt.Sprintf("%T", sampler), func(t *testing.T) {
+		t.Run(sand.name(), func(t *testing.T) {
 			test := defaultTestFuncs()
 			test.tracestate = func() trace.TraceState {
 				return testTs
@@ -67,39 +92,223 @@ func TestAlwaysSample(t *testing.T) {
 			test.attributes = func() []attribute.KeyValue {
 				return testAttrs
 			}
-			params := makeTestContext(test).SamplingParameters
-			sampler := AlwaysSample()
+			ts := testTs
 
-			result := sampler.ShouldSample(params)
+			// Consistent AlwaysOn samplers introduce th:0.
+			if sand.data {
+				ts = testTsWith("th:0")
+			}
+
+			// tracestater is always unmodified because the incoming
+			// threshold is unknown
+			params := makeTestContext(test).SamplingParameters
+
+			result := sand.sampler.ShouldSample(params)
 			require.Equal(t, RecordAndSample, result.Decision)
 			require.Empty(t, result.Attributes)
-			require.Equal(t, testTs, result.Tracestate)
+			require.Equal(t, ts, result.Tracestate)
 		})
 	}
 }
 
-func TestParentBased(t *testing.T) {
-	// for _, sampler := range []Sampler{
-	// 	AlwaysSample(),
-	// 	CompositeSampler(ComposableAlwaysSample()),
-	// } {
-	// 	t.Run(fmt.Sprintf("%T", sampler), func(t *testing.T) {
-	// 		test := defaultTestFuncs()
-	// 		test.tracestate = func() trace.TraceState {
-	// 			return testTs
-	// 		}
-	// 		test.attributes = func() []attribute.KeyValue {
-	// 			return testAttrs
-	// 		}
-	// 		params := makeTestContext(test).SamplingParameters
-	// 		sampler := AlwaysSample()
+// TestChildSpanUnknownThresholdNotSampled tests a sampled child span
+// unsampled context w/o tracestate.  All will not sample this span.
+func TestChildSpanUnknownThresholdNotSampled(t *testing.T) {
+	for _, sand := range []samplerAnd[bool]{
+		{ParentBased(AlwaysSample()), false},
+		{CompositeSampler(ComposableParentBased(ComposableAlwaysSample())), false},
+	} {
+		t.Run(sand.name(), func(t *testing.T) {
+			test := defaultTestFuncs()
+			test.sampled = func() bool {
+				return false
+			}
+			test.tracestate = func() trace.TraceState {
+				return testTs
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+			ts := testTs
 
-	// 		result := sampler.ShouldSample(params)
-	// 		require.Equal(t, RecordAndSample, result.Decision)
-	// 		require.Empty(t, result.Attributes)
-	// 		require.Equal(t, testTs, result.Tracestate)
-	// 	})
-	// }
+			// tracestater is always unmodified because the incoming
+			// threshold is unknown
+			params := makeTestContext(test).SamplingParameters
+
+			result := sand.sampler.ShouldSample(params)
+			require.Equal(t, Drop, result.Decision)
+			require.Empty(t, result.Attributes)
+			require.Equal(t, ts, result.Tracestate)
+		})
+	}
+}
+
+// TestChildSpanInvalidThresholdSampled tests samplers
+// in a valid-threshold, sampled child context.
+func TestChildSpanValidThresholdSampled(t *testing.T) {
+	for _, sampler := range []Sampler{
+		AlwaysSample(),
+		CompositeSampler(ComposableAlwaysSample()),
+		ParentBased(AlwaysSample()),
+		CompositeSampler(ComposableParentBased(ComposableAlwaysSample())),
+	} {
+		// These tests run in a child span context with valid threshold.
+		// All sample, all produce threshold.
+		t.Run(fmt.Sprintf("%T:%v", sampler, sampler.Description()), func(t *testing.T) {
+			ts100 := testTsWith("th:0")
+			test := defaultTestFuncs()
+			test.tracestate = func() trace.TraceState {
+				return ts100
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+
+			// tracestate is always unmodified because the incoming
+			// threshold was known.
+			params := makeTestContext(test).SamplingParameters
+
+			result := sampler.ShouldSample(params)
+			require.Equal(t, RecordAndSample, result.Decision)
+			require.Empty(t, result.Attributes)
+			require.Equal(t, ts100, result.Tracestate)
+		})
+	}
+}
+
+// TestChildSpanInvalidThresholdNotSampled tests the case where the sampled flag
+// and threshold disagree and the sampled flag is FALSE.
+func TestChildSpanInvalidThresholdNotSampled(t *testing.T) {
+	for _, sand := range []samplerAnd[bool]{
+		{ParentBased(AlwaysSample()), false},
+		{CompositeSampler(ComposableParentBased(ComposableAlwaysSample())), true},
+	} {
+		// These tests run in a child span context.
+		t.Run(sand.name(), func(t *testing.T) {
+			test := defaultTestFuncs()
+			test.sampled = func() bool {
+				// saying not sampled
+				return false
+			}
+			// saying 100% sampled
+			ts100 := testTsWith("th:0")
+
+			test.tracestate = func() trace.TraceState {
+				return ts100
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+
+			params := makeTestContext(test).SamplingParameters
+
+			result := sand.sampler.ShouldSample(params)
+			if sand.data {
+				require.Equal(t, RecordAndSample, result.Decision)
+			} else {
+				require.Equal(t, Drop, result.Decision)
+			}
+			require.Empty(t, result.Attributes)
+			require.Equal(t, ts100, result.Tracestate)
+		})
+	}
+}
+
+// TestSampledInvalidThreshold tests the case where the sampled flag
+// and threshold disagree and the sampled flag is TRUE.
+func TestChildSpanInvalidThresholdSampled(t *testing.T) {
+	for _, sand := range []samplerAnd[bool]{
+		{ParentBased(AlwaysSample()), false},
+		{CompositeSampler(ComposableParentBased(ComposableAlwaysSample())), true},
+	} {
+		// These tests run in a child span context.
+		t.Run(sand.name(), func(t *testing.T) {
+			test := defaultTestFuncs()
+			test.sampled = func() bool {
+				// saying sampled
+				return true
+			}
+			// saying 2^-56 sampled; assume no traceID matches.
+			tsFF := testTsWith("th:ffffffffffffff")
+
+			test.tracestate = func() trace.TraceState {
+				return tsFF
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+
+			params := makeTestContext(test).SamplingParameters
+
+			result := sand.sampler.ShouldSample(params)
+			// Both sample
+			require.Equal(t, RecordAndSample, result.Decision)
+			if sand.data {
+				// the invalid threshold is erased,
+				require.Equal(t, testTs, result.Tracestate)
+			} else {
+				// the invalid threshold is NOT erased
+				require.Equal(t, tsFF, result.Tracestate)
+			}
+			require.Empty(t, result.Attributes)
+		})
+	}
+}
+
+func TestTraceIdRatioBased(t *testing.T) {
+	yes := trace.TraceID{0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0}
+	no := trace.TraceID{0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	for _, sand := range []samplerAnd2[trace.TraceID, bool]{
+		{CompositeSampler(TraceIDRatioBased(0.5)), no, false},
+		{CompositeSampler(TraceIDRatioBased(0.5)), yes, true},
+		{CompositeSampler(ComposableParentBased(TraceIDRatioBased(0.5))), no, false},
+		{CompositeSampler(ComposableParentBased(TraceIDRatioBased(0.5))), yes, true},
+	} {
+		t.Run(sand.name(), func(t *testing.T) {
+
+			test := defaultTestFuncs()
+			test.tracestate = func() trace.TraceState {
+				return testTs
+			}
+			test.attributes = func() []attribute.KeyValue {
+				return testAttrs
+			}
+			test.sampled = func() bool { return false }
+			test.parentid = func(*rand.Rand) trace.TraceID {
+				// These tests run in a root span context.
+				return trace.TraceID{}
+			}
+			test.traceid = func(*rand.Rand) trace.TraceID {
+				// These tests run in a root span context.
+				return sand.data1
+			}
+
+			params := makeTestContext(test).SamplingParameters
+
+			result := sand.sampler.ShouldSample(params)
+			// Both sample
+			if sand.data2 {
+				require.Equal(t, RecordAndSample, result.Decision)
+
+				// tracestate has ot=th:8
+				require.Equal(t, testTsWith("th:8"), result.Tracestate)
+			} else {
+				require.Equal(t, Drop, result.Decision)
+
+				// tracestate unmodified b/c not sampled
+				require.Equal(t, testTs, result.Tracestate)
+			}
+			require.Empty(t, result.Attributes)
+		})
+	}
+}
+
+func testTsWith(otts string) trace.TraceState {
+	mod, err := testTs.Insert("ot", otts)
+	if err != nil {
+		panic(fmt.Errorf("impossible test fail: %w", err))
+	}
+	return mod
 }
 
 type testContext struct {
@@ -108,6 +317,8 @@ type testContext struct {
 }
 
 type testFuncs struct {
+	parentid   func(*rand.Rand) trace.TraceID
+	traceid    func(*rand.Rand) trace.TraceID
 	sampled    func() bool
 	remote     func() bool
 	tracestate func() trace.TraceState
@@ -125,11 +336,11 @@ func makeBenchContexts(
 ) (
 	r []testContext,
 ) {
-	randSource := rand.New(rand.NewSource(101333))
+	rnd := rand.New(rand.NewSource(101333))
 	for range max(n, maxContexts) {
 		var cfg trace.SpanContextConfig
-		randSource.Read(cfg.TraceID[:])
-		randSource.Read(cfg.SpanID[:])
+		cfg.TraceID = bfuncs.parentid(rnd)
+		rnd.Read(cfg.SpanID[:])
 		if bfuncs.sampled() {
 			cfg.TraceFlags = 3
 		}
@@ -141,11 +352,15 @@ func makeBenchContexts(
 			context.Background(),
 			trace.NewSpanContext(cfg),
 		)
+		tid := cfg.TraceID
+		if !tid.IsValid() {
+			tid = bfuncs.traceid(rnd)
+		}
 		r = append(r, testContext{
 			Context: ctx,
 			SamplingParameters: SamplingParameters{
 				ParentContext: ctx,
-				TraceID:       cfg.TraceID,
+				TraceID:       tid,
 				Name:          bfuncs.name(),
 				Kind:          bfuncs.kind(),
 				Attributes:    bfuncs.attributes(),
@@ -158,6 +373,14 @@ func makeBenchContexts(
 
 func defaultTestFuncs() testFuncs {
 	return testFuncs{
+		parentid: func(rnd *rand.Rand) (tid trace.TraceID) {
+			rnd.Read(tid[:])
+			return
+		},
+		traceid: func(rnd *rand.Rand) (tid trace.TraceID) {
+			rnd.Read(tid[:])
+			return
+		},
 		sampled: func() bool { return true },
 		remote:  func() bool { return true },
 		tracestate: func() trace.TraceState {
@@ -197,54 +420,106 @@ func BenchmarkConsistentAlwaysOn(b *testing.B) {
 	}
 }
 
-func BenchmarkConsistentParentBased(b *testing.B) {
+func BenchmarkConsistentAlwaysOn(b *testing.B) {
 	ctxs := makeSimpleContexts(b.N)
-	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	sampler := CompositeSampler(ComposableAlwaysSample())
 	b.ResetTimer()
 	for i := range b.N {
 		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
 	}
 }
 
-func BenchmarkConsistentParentBasedWithNonEmptyTraceState(b *testing.B) {
-	bfs := defaultTestFuncs()
-	bfs.tracestate = func() trace.TraceState {
-		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir")
-		require.NoError(b, err)
-		return ts
-	}
-	ctxs := makeBenchContexts(b.N, bfs)
-	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+func BenchmarkComposableParentBasedUnknownThreshold(b *testing.B) {
+	ctxs := makeSimpleContexts(b.N)
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
 	b.ResetTimer()
 	for i := range b.N {
 		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
 	}
 }
 
-func BenchmarkConsistentParentBasedWithNonEmptyOTelTraceState(b *testing.B) {
-	bfs := defaultTestFuncs()
-	bfs.tracestate = func() trace.TraceState {
-		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def")
-		require.NoError(b, err)
+func BenchmarkComposableParentBasedParentThreshold(b *testing.B) {
+	ts, err := trace.ParseTraceState("ot=th:0")
+	require.NoError(b, err)
+	bfuncs := defaultTestFuncs()
+	bfuncs.tracestate = func() trace.TraceState {
 		return ts
 	}
-	ctxs := makeBenchContexts(b.N, bfs)
-	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	ctxs := makeBenchContexts(b.N, bfuncs)
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
 	b.ResetTimer()
 	for i := range b.N {
 		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
 	}
 }
 
-func BenchmarkConsistentParentBasedWithNonEmptyOTelTraceStateIncludingRandomness(b *testing.B) {
+func BenchmarkComposableParentBasedNonEmptyTraceStateUnknownThreshold(b *testing.B) {
+	ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir")
+	require.NoError(b, err)
 	bfs := defaultTestFuncs()
 	bfs.tracestate = func() trace.TraceState {
-		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;rv:abcdefabcdefab")
-		require.NoError(b, err)
 		return ts
 	}
 	ctxs := makeBenchContexts(b.N, bfs)
-	sampler := CompositeSampler(ConsistentParentBased(ComposableAlwaysSample()))
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkComposableParentBasedNonEmptyOTelTraceStateUnknownThreshold(b *testing.B) {
+	ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def")
+	require.NoError(b, err)
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkComposableParentBasedNonEmptyOTelTraceStateParentThreshold(b *testing.B) {
+	ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;th:0")
+	require.NoError(b, err)
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkComposableParentBasedWithNonEmptyOTelTraceStateIncludingRandomness(b *testing.B) {
+	ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;th:0;rv:abcdefabcdefab")
+	require.NoError(b, err)
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		return ts
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := CompositeSampler(ComposableParentBased(ComposableAlwaysSample()))
+	b.ResetTimer()
+	for i := range b.N {
+		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
+	}
+}
+
+func BenchmarkParentBasedNoTraceState(b *testing.B) {
+	bfs := defaultTestFuncs()
+	bfs.tracestate = func() trace.TraceState {
+		return trace.TraceState{}
+	}
+	ctxs := makeBenchContexts(b.N, bfs)
+	sampler := ParentBased(AlwaysSample())
 	b.ResetTimer()
 	for i := range b.N {
 		_ = sampler.ShouldSample(ctxs[i%maxContexts].SamplingParameters)
@@ -252,10 +527,10 @@ func BenchmarkConsistentParentBasedWithNonEmptyOTelTraceStateIncludingRandomness
 }
 
 func BenchmarkParentBasedWithOTelTraceStateIncludingRandomness(b *testing.B) {
+	ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;rv:abcdefabcdefab")
+	require.NoError(b, err)
 	bfs := defaultTestFuncs()
 	bfs.tracestate = func() trace.TraceState {
-		ts, err := trace.ParseTraceState("co=whateverr,ed=nowaysir,ot=xx:abc;yy:def;rv:abcdefabcdefab")
-		require.NoError(b, err)
 		return ts
 	}
 	ctxs := makeBenchContexts(b.N, bfs)

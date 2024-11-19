@@ -85,6 +85,13 @@ var simpleAlwaysSampleTracestate = func() trace.TraceState {
 	return rts
 }()
 
+func updateOT(original trace.TraceState, out string) (trace.TraceState, error) {
+	if out == "" {
+		return original.Delete("ot"), nil
+	}
+	return original.Insert("ot", out)
+}
+
 // combineTracestate combines an existing OTel tracestate fragment,
 // which is the value of a top-level "ot" tracestate vendor tag.
 func combineTracestate(original trace.TraceState, updateThreshold int64, hadThreshold bool, thPos fieldPos) (trace.TraceState, error) {
@@ -131,7 +138,7 @@ func combineTracestate(original trace.TraceState, updateThreshold int64, hadThre
 
 	if updateThreshold < 0 {
 		copyExceptThreshold()
-		return original.Insert("ot", out.String())
+		return updateOT(original, out.String())
 	}
 	// Sections is zero or non-zero, absolute value does not matter.
 	var sections int
@@ -155,5 +162,5 @@ func combineTracestate(original trace.TraceState, updateThreshold int64, hadThre
 		// Format as an unsigned integer and remove trailing zeros.
 		out.WriteString(strings.TrimRight(strconv.FormatUint(uint64(updateThreshold), 16), "0"))
 	}
-	return original.Insert("ot", out.String())
+	return updateOT(original, out.String())
 }

@@ -3,25 +3,6 @@
 
 package sampler
 
-// List of all sampler instances:
-//
-//
-// ORIGINAL:
-//   TraceIdRatioBased
-//   AlwaysOn
-//   AlwaysOff
-//   ParentBased
-//
-// NEW:
-//   RuleBased
-//   AnyOf
-//   ParentThreshold
-//   Annotating
-//   ConsistentParentBased (a composition)
-//
-// ADAPTER:
-//   CompositeSampler (V2 -> V1)
-
 import (
 	"context"
 	"encoding/binary"
@@ -31,8 +12,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
-	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -90,18 +69,6 @@ type SamplingResult struct {
 	// The export-only span has to encode its sampling threshold
 	// without propagating the threshold into the context.  This could
 	// be accomplished through _two_ tracestate returns?
-}
-
-// NEW PROTOTYPE BELOW
-
-// SamplerOptimizer is an optional interface to optimize Samplers.
-type SamplerOptimizer interface {
-	Optimize(*resource.Resource, instrumentation.Scope) Sampler
-}
-
-// ComposableSamplerOptimizer is an optional interface to optimize ComposableSamplers.
-type ComposableSamplerOptimizer interface {
-	Optimize(*resource.Resource, instrumentation.Scope) ComposableSampler
 }
 
 // ComposableSamplingParameters extend SamplingParameters.
@@ -340,7 +307,6 @@ type ruleBasedConfig struct {
 type ruleBased []ruleAndPredicate
 
 var _ ComposableSampler = &ruleBased{}
-var _ ComposableSamplerOptimizer = &ruleBased{}
 
 // Description implements ComposableSampler.
 func (rb ruleBased) Description() string {
@@ -364,6 +330,7 @@ func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) Sampl
 		if rule.Decide(params) {
 			return rule.ComposableSampler.GetSamplingIntent(params)
 		}
+
 	}
 
 	// When no rules match.  This will not happen when there is a
@@ -373,8 +340,8 @@ func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) Sampl
 	}
 }
 
-// ConsistentParentBased combines a root sampler and a ParentThreshold.
-func ConsistentParentBased(root ComposableSampler) ComposableSampler {
+// ComposableParentBased combines a root sampler and a ParentThreshold.
+func ComposableParentBased(root ComposableSampler) ComposableSampler {
 	return RuleBased(
 		WithRule(IsRootPredicate(), root),
 		WithDefaultRule(ParentThreshold()),
@@ -416,7 +383,6 @@ type annotatingSampler struct {
 }
 
 var _ ComposableSampler = &annotatingSampler{}
-var _ ComposableSamplerOptimizer = &annotatingSampler{}
 
 func AnnotatingSampler(sampler ComposableSampler, options ...AnnotatingOption) ComposableSampler {
 	var config annotatingConfig
@@ -482,12 +448,11 @@ type compositeSampler struct {
 }
 
 var _ Sampler = &compositeSampler{}
-var _ SamplerOptimizer = &compositeSampler{}
 
 // ShouldSample implements Sampler.
 func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResult {
 	// Note: I experimented with making the steps below be lazy,
-	// since not all Sampler configurations will use the result,
+	// since not all Sampler configurations will use the results,
 	// by using sync.Once and a func().  This isn't worthwhile
 	// because the additional allocations counteract the savings:
 	// - trace.SpanContextFromContext
@@ -502,14 +467,6 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	otts := returnTracestate.Get("ot")
 
 	threshold, saveThresholdPos, hasThreshold := tracestateHasThreshold(otts)
-
-	switch {
-	case hasThreshold:
-	case psc.IsSampled():
-		threshold = INVALID_THRESHOLD
-	default:
-		threshold = NEVER_SAMPLE_THRESHOLD
-	}
 
 	var hasRandom bool
 	var rnd int64
@@ -526,6 +483,36 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		// bits of randomness, as specified in W3C Trace
 		// Context Level 2.
 		rnd = int64(binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask)
+	}
+
+	// thresholdChange indicates whether we have to edit the
+	// threshold, which is true for invalid arriving thresholds
+	// and for sampler-changed outcomes.
+	thresholdChange := false
+	switch {
+	case hasThreshold:
+		// Validate the threshold.
+		tsampled := threshold <= rnd
+		fsampled := psc.IsSampled()
+
+		switch {
+		case tsampled && fsampled:
+			// Good. The two agree.
+		case tsampled:
+			// Threshold says sampled, flag says not.
+			psc = psc.WithTraceFlags(psc.TraceFlags() | trace.FlagsSampled)
+		case fsampled:
+			// Flag says sampled, threshold says not.
+			threshold = INVALID_THRESHOLD
+			thresholdChange = true
+		default:
+			// Good. The two agree.
+		}
+
+	case psc.IsSampled():
+		threshold = INVALID_THRESHOLD
+	default:
+		threshold = NEVER_SAMPLE_THRESHOLD
 	}
 
 	intent := c.sampler.GetSamplingIntent(ComposableSamplingParameters{
@@ -547,6 +534,9 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	default:
 		sampled = intent.Threshold <= rnd
 	}
+	if intent.Threshold != threshold {
+		thresholdChange = true
+	}
 
 	var decision SamplingDecision
 	var attrs []attribute.KeyValue
@@ -557,8 +547,9 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		if intent.Attributes != nil {
 			attrs = intent.Attributes()
 		}
-		if intent.Threshold != threshold {
+		if thresholdChange {
 			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
+		} else {
 		}
 	case intent.Export:
 		// Note: this is a study in what it would take to update the sampling
@@ -569,8 +560,9 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		if intent.Attributes != nil {
 			attrs = intent.Attributes()
 		}
-		if intent.Threshold != threshold {
+		if thresholdChange {
 			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
+		} else {
 		}
 	case intent.Record:
 		decision = RecordOnly
