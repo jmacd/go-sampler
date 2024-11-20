@@ -144,27 +144,54 @@ by composable samplers and enforcing consistent sampling.  The
 original OTel-Go AlwaysOn and ParentBased samplers are included as a
 reference.
 
+These benchmarks are not comprehensive, but the illusrate what can be
+achieved with this approach.  Note that this code has a fast-path
+optimization for the `AlwaysSample()` case, which is the case where an
+empty TraceContext is modifed to include `ot=th:0`.  All of the
+standard parent-based sampling configurations, therefore, do not
+modify TraceState and have zero memory allocations.
+
 ```
+goos: darwin
+goarch: arm64
+pkg: github.com/jmacd/go-sampler
+BenchmarkAlwaysOn-10                                                       	67102522	        19.96 ns/op	       0 B/op	       0 allocs/op
+BenchmarkConsistentAlwaysOn-10                                             	26184316	        45.24 ns/op	       0 B/op	       0 allocs/op
+BenchmarkComposableParentBasedUnknownThreshold-10                          	14998062	        72.46 ns/op	       0 B/op	       0 allocs/op
+BenchmarkComposableParentBasedParentThreshold-10                           	13936856	        85.01 ns/op	       0 B/op	       0 allocs/op
+BenchmarkComposableParentBasedNonEmptyTraceStateUnknownThreshold-10        	16190498	        75.56 ns/op	       0 B/op	       0 allocs/op
+BenchmarkComposableParentBasedNonEmptyOTelTraceStateUnknownThreshold-10    	12790028	        92.12 ns/op	       0 B/op	       0 allocs/op
+BenchmarkComposableParentBasedNonEmptyOTelTraceStateParentThreshold-10     	 8466374	       138.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParentBasedNoTraceState-10                                        	20660518	        56.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParentBasedWithOTelTraceStateIncludingRandomness-10               	21257059	        65.72 ns/op	       0 B/op	       0 allocs/op
 ```
 
-### Export-only problem
+## Areas not explored
 
-Need a new return value.
+### Export-only spans
 
+For this prototype, I wanted to explore a potential API change that
+would allow Samplers to indicate that spans should be exported even
+when the context is not sampled.
 
-### Not explored
+This was explored, but not concluded.  One finding is that if the span
+is to be exported with a threshold in its tracestate, despite being
+unsampled, the Sampler needs a way to return or modify the tracestate
+attached to the span independent from the one it returns to the child
+context.
 
-Optimizing for scope and resource
+### Potential optimizations
 
-// NEW PROTOTYPE BELOW
+The difference between the Java and Go prototypes comes down to
+handling SpanKind as a special parameter, or not.  There are standing
+requests in OpenTelemetry to incorporate the Resouce and Scope value
+into the sampling decision.
 
-// SamplerOptimizer is an optional interface to optimize Samplers.
-type SamplerOptimizer interface {
-	Optimize(*resource.Resource, instrumentation.Scope) Sampler
-}
-
-// ComposableSamplerOptimizer is an optional interface to optimize ComposableSamplers.
-type ComposableSamplerOptimizer interface {
-	Optimize(*resource.Resource, instrumentation.Scope) ComposableSampler
-}
+There are potentially a number of directions to explore here,
+including ways to compile aggregate sampler behavior with
+optimizations.  For example, a RuleBased sampler can be re-organized
+to have one set of rules per span kind.  Similarly, composable sampler
+predicates could be pre-evaluated in terms of resource and scope
+attributes that are available, in order to lower the cost of sampler
+evaluation.
 
