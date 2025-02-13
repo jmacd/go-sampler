@@ -63,12 +63,6 @@ type SamplingResult struct {
 	Decision   SamplingDecision
 	Attributes []attribute.KeyValue
 	Tracestate trace.TraceState
-
-	// Note: The experimental ExportOnly feature explored in this
-	// package indicates the need for a new result of some sort.
-	// The export-only span has to encode its sampling threshold
-	// without propagating the threshold into the context.  This could
-	// be accomplished through _two_ tracestate returns?
 }
 
 // ComposableSamplingParameters extend SamplingParameters.
@@ -95,13 +89,10 @@ type ComposableSamplingParameters struct {
 	// sampled.
 	parentThreshold int64
 
-	// randomnessValue is provided for allowing composable
-	// samplers to differentiate between _they_ decided to sample
-	// and _anyone_ decided to sample.
-	//
-	// Note: this doesn't really work if sampler is able to
-	// modify the RV.
-	randomnessValue int64
+	// parentThresholdReliable indicates whether the thresohld
+	// was defined (reliable) or not, because a context had the
+	// sampled flag and no threshold.
+	parentThresholdReliable bool
 }
 
 // ComposableSampler is a sampler which separates its intentions from
@@ -116,28 +107,26 @@ type ComposableSampler interface {
 	Description() string
 }
 
+// AttributesFunc is a function that returns a set of attributes.
 type AttributesFunc func() []attribute.KeyValue
+
+// TraceStateFunc is a function that modifies a TraceState.
+type TraceStateFunc func(trace.TraceState) trace.TraceState
 
 // SamplingIntent returns this sampler's intention.
 type SamplingIntent struct {
-	Record     bool  // whether to record
-	Export     bool  // whether to export, implies record
-	Threshold  int64 // i.e., sampling probability, implies record & export when...
-	Attributes AttributesFunc
+	Record            bool           // whether to record
+	Threshold         int64          // i.e., sampling probability, implies record & export when...
+	ThresholdReliable bool           // whether the threshold is reliable
+	Attributes        AttributesFunc // add attributes the span
+	TraceState        TraceStateFunc // update the tracestate
 }
 
-// WouldSample allows a ComposableSampler to conditionalize the attributes
-// they attach to the span based on whether a specific sampler decides to
-// sample, independent of the overall decision.
-func (in SamplingIntent) WouldSample(params ComposableSamplingParameters) bool {
-	return in.Threshold < params.randomnessValue
-}
-
-// TraceIDRatioBased
+// TraceIDRatioBased is the OTel-specified probabilistic sampler. This was
+// defined in OTEP 235.
 //
-// TraceIDRatioBased is the OTel-specified probabilistic sampler.
-//
-// TODO: Add support for variable precision?
+// Note: Add support for variable precision? This has been done in e.g.,
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/9b515fb83b3f010c4c37f3135caf535e391fb3a3/pkg/sampling/probability.go#L33
 func TraceIDRatioBased(fraction float64) ComposableSampler {
 	const (
 		maxp  = 14                       // maximum precision is 56 bits
@@ -199,6 +188,8 @@ type traceIDRatio struct {
 	description string
 }
 
+var _ ComposableSampler = &traceIDRatio{}
+
 // Description implements ComposableSampler.
 func (ts *traceIDRatio) Description() string {
 	return ts.description
@@ -207,7 +198,8 @@ func (ts *traceIDRatio) Description() string {
 // GetSamplingIntent implements ComposableSampler.
 func (ts *traceIDRatio) GetSamplingIntent(p ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: int64(ts.threshold),
+		Threshold:         int64(ts.threshold),
+		ThresholdReliable: true,
 	}
 }
 
@@ -221,6 +213,8 @@ func AlwaysSample() Sampler {
 }
 
 type alwaysOn struct{}
+
+var _ Sampler = alwaysOn{}
 
 func (alwaysOn) ShouldSample(params SamplingParameters) SamplingResult {
 	return SamplingResult{
@@ -242,10 +236,13 @@ func ComposableAlwaysSample() ComposableSampler {
 
 type cAlwaysOn struct{}
 
+var _ ComposableSampler = cAlwaysOn{}
+
 // GetSamplingIntent implements ComposableSampler.
 func (cAlwaysOn) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: ALWAYS_SAMPLE_THRESHOLD,
+		Threshold:         ALWAYS_SAMPLE_THRESHOLD,
+		ThresholdReliable: true,
 	}
 }
 
@@ -266,6 +263,8 @@ func ComposableNeverSample() ComposableSampler {
 
 type alwaysOff struct{}
 
+var _ ComposableSampler = alwaysOff{}
+
 // GetSamplingIntent implements ComposableSampler.
 func (alwaysOff) GetSamplingIntent(ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
@@ -278,8 +277,7 @@ func (alwaysOff) Description() string {
 	return "AlwaysOff"
 }
 
-// RuleBased
-
+// RuleBased is a composite sampler that selects a delegate sampler based on a set of rules.
 func RuleBased(options ...RuleBasedOption) ComposableSampler {
 	rbc := &ruleBasedConfig{}
 	for _, opt := range options {
@@ -330,7 +328,6 @@ func (rb ruleBased) GetSamplingIntent(params ComposableSamplingParameters) Sampl
 		if rule.Decide(params) {
 			return rule.ComposableSampler.GetSamplingIntent(params)
 		}
-
 	}
 
 	// When no rules match.  This will not happen when there is a
@@ -360,7 +357,8 @@ var _ ComposableSampler = &parentThreshold{}
 // GetSamplingIntent implements ComposableSampler.
 func (parentThreshold) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
 	return SamplingIntent{
-		Threshold: params.parentThreshold,
+		Threshold:         params.parentThreshold,
+		ThresholdReliable: params.parentThresholdReliable,
 	}
 }
 
@@ -419,21 +417,14 @@ func WithSampledAttributes(af AttributesFunc) AnnotatingOption {
 // GetSamplingIntent implements ComposableSampler.
 func (as annotatingSampler) GetSamplingIntent(params ComposableSamplingParameters) SamplingIntent {
 	intent := as.sampler.GetSamplingIntent(params)
-
-	// N.B.: We can make this conditional on whether this
-	// sampler's child decided to sample, vs any sampler decided
-	// to sample.
-	// if intent.WouldSample(params) {
-	//
-	// }
 	intent.Attributes = combineAttributesFunc(intent.Attributes, as.attributes)
-
 	return intent
 }
 
 // Description implements ComposableSampler.
 func (as annotatingSampler) Description() string {
-	return fmt.Sprintf("Annotating(%s)", as.sampler.Description())
+	set := attribute.NewSet(as.attributes()...)
+	return fmt.Sprintf("Annotate(%s, %s)", as.sampler.Description(), attribute.DefaultEncoder().Encode(set.Iter()))
 }
 
 // CompositeSampler construct a Sampler from a ComposableSampler.
@@ -466,7 +457,8 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	returnTracestate := psc.TraceState()
 	otts := returnTracestate.Get("ot")
 
-	threshold, saveThresholdPos, hasThreshold := tracestateHasThreshold(otts)
+	parsedThreshold, saveThresholdPos, hasThreshold := tracestateHasThreshold(otts)
+	threshold := parsedThreshold
 
 	var hasRandom bool
 	var rnd int64
@@ -485,10 +477,9 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		rnd = int64(binary.BigEndian.Uint64(params.TraceID[8:16]) & randomnessMask)
 	}
 
-	// thresholdChange indicates whether we have to edit the
-	// threshold, which is true for invalid arriving thresholds
-	// and for sampler-changed outcomes.
-	thresholdChange := false
+	// thresholdReliable indicates whether the threshold is reliable
+	// in terms defined in #4321.
+	thresholdReliable := false
 	switch {
 	case hasThreshold:
 		// Validate the threshold.
@@ -498,13 +489,14 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		switch {
 		case tsampled && fsampled:
 			// Good. The two agree.
+			thresholdReliable = true
 		case tsampled:
 			// Threshold says sampled, flag says not.
 			psc = psc.WithTraceFlags(psc.TraceFlags() | trace.FlagsSampled)
+			thresholdReliable = true
 		case fsampled:
-			// Flag says sampled, threshold says not.
+			// Flag says sampled, threshold says not. This erases the invalid threshold.
 			threshold = INVALID_THRESHOLD
-			thresholdChange = true
 		default:
 			// Good. The two agree.
 		}
@@ -516,26 +508,20 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 	}
 
 	intent := c.sampler.GetSamplingIntent(ComposableSamplingParameters{
-		SamplingParameters: params,
-		ParentSpanContext:  psc,
-		parentThreshold:    threshold,
-		randomnessValue:    rnd,
+		SamplingParameters:      params,
+		ParentSpanContext:       psc,
+		parentThreshold:         threshold,
+		parentThresholdReliable: thresholdReliable,
 	})
 
-	// We only need to know the randomness when threshold is in a
-	// range where it matters.  Since this is used only once, no
-	// need for a sync.Once.
 	var sampled bool
 	switch {
-	case intent.Threshold == NEVER_SAMPLE_THRESHOLD:
+	case intent.Threshold >= NEVER_SAMPLE_THRESHOLD:
 		sampled = false
 	case intent.Threshold <= ALWAYS_SAMPLE_THRESHOLD:
 		sampled = true
 	default:
 		sampled = intent.Threshold <= rnd
-	}
-	if intent.Threshold != threshold {
-		thresholdChange = true
 	}
 
 	var decision SamplingDecision
@@ -547,23 +533,7 @@ func (c *compositeSampler) ShouldSample(params SamplingParameters) SamplingResul
 		if intent.Attributes != nil {
 			attrs = intent.Attributes()
 		}
-		if thresholdChange {
-			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
-		} else {
-		}
-	case intent.Export:
-		// Note: this is a study in what it would take to update the sampling
-		// API to support export-only sampling decisions.  In this case, we still
-		// have a well-defined threshold and want to use it, but we do not want
-		// it to propagate to the context.
-		decision = ExportOnly
-		if intent.Attributes != nil {
-			attrs = intent.Attributes()
-		}
-		if thresholdChange {
-			returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, hasThreshold, saveThresholdPos)
-		} else {
-		}
+		returnTracestate, err = combineTracestate(returnTracestate, intent.Threshold, intent.ThresholdReliable, parsedThreshold, saveThresholdPos, hasThreshold)
 	case intent.Record:
 		decision = RecordOnly
 		attrs = intent.Attributes()

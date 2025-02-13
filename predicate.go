@@ -84,3 +84,9 @@ func IsRemotePredicate() Predicate {
 		return params.ParentSpanContext.IsValid() && params.ParentSpanContext.IsRemote()
 	}, "remote?")
 }
+
+func IsLocalPredicate() Predicate {
+	return NewPredicate(func(params ComposableSamplingParameters) bool {
+		return params.ParentSpanContext.IsValid() && !params.ParentSpanContext.IsRemote()
+	}, "local?")
+}

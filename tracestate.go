@@ -68,12 +68,12 @@ func tracestateHasThreshold(otts string) (int64, fieldPos, bool) {
 	}
 	if len(val) == 0 || len(val) > 14 {
 		otel.Handle(fmt.Errorf("could not parse tracestate threshold: %q: %w", otts, strconv.ErrSyntax))
-		return 0, fieldPos{}, false
+		return -1, fieldPos{}, false
 	}
 	th, err := strconv.ParseUint(val, 16, 64)
 	if err != nil {
 		otel.Handle(fmt.Errorf("could not parse tracestate threshold: %q: %w", val, err))
-		return 0, fieldPos{}, false
+		return -1, fieldPos{}, false
 	}
 	// Add trailing zeros
 	th <<= (14 - len(val)) * 4
@@ -94,14 +94,18 @@ func updateOT(original trace.TraceState, out string) (trace.TraceState, error) {
 
 // combineTracestate combines an existing OTel tracestate fragment,
 // which is the value of a top-level "ot" tracestate vendor tag.
-func combineTracestate(original trace.TraceState, updateThreshold int64, hadThreshold bool, thPos fieldPos) (trace.TraceState, error) {
+func combineTracestate(original trace.TraceState, updateThreshold int64, thresholdReliable bool, parsedThreshold int64, thPos fieldPos, hasThreshold bool) (trace.TraceState, error) {
+	// Try to optimize several fast paths. Remember this is a prototype :-)
 	switch {
-	case !hadThreshold && updateThreshold < 0:
-		// Missing threshold, no update case.
+	case !thresholdReliable && !hasThreshold && parsedThreshold == 0:
+		// No threshold in, no threshold out.
 		return original, nil
 	case original.Len() == 0 && updateThreshold == 0:
 		// Empty tracestate, 100% sampling case.
 		return simpleAlwaysSampleTracestate, nil
+	case thresholdReliable && hasThreshold && parsedThreshold == updateThreshold:
+		// Unchanged (e.g., due to ParentThreshold)
+		return original, nil
 	}
 
 	// By design the OT tracestate value is unmodified.
@@ -136,13 +140,13 @@ func combineTracestate(original trace.TraceState, updateThreshold int64, hadThre
 		return sections
 	}
 
-	if updateThreshold < 0 {
+	if !thresholdReliable {
 		copyExceptThreshold()
 		return updateOT(original, out.String())
 	}
 	// Sections is zero or non-zero, absolute value does not matter.
 	var sections int
-	if hadThreshold {
+	if thPos.start != thPos.end {
 		sections = copyExceptThreshold()
 	} else {
 		_, _ = out.WriteString(unmodified)

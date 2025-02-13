@@ -328,7 +328,7 @@ type testFuncs struct {
 	links      func() []trace.Link
 }
 
-const maxContexts = 10000
+const maxContexts = 1000
 
 func makeBenchContexts(
 	n int,
