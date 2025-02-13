@@ -72,7 +72,7 @@ can.  This enables two optimizations:
    global decision to sample.  For a sampler to ask "would I sample?"
    the randomness value needs to be accessible in the parameters and
    cannot be mutated.
-   
+
 The upshot of this is that for a Root sampler to set the randomness
 value, it will have to be done outside of the composite samplerinterface.
 
@@ -134,9 +134,6 @@ func ComposableParentBased(root ComposableSampler) ComposableSampler {
 This is a convenience implementation of `ComposableSampler` meant to
 support adding span attributes while using `ComposableSampler` APIs.
 
-TODO: This is not well tested.  This is where we could potentially use
-the `WouldSample()` method above.
-
 ## Benchmarks
 
 The benchmarks here are sufficient to identify the overhead introduced
@@ -154,7 +151,7 @@ modify TraceState and have zero memory allocations.
 ```
 goos: darwin
 goarch: arm64
-pkg: github.com/jmacd/go-sampler
+pkg: github.com/jmacd/sampler
 BenchmarkAlwaysOn-10                                                       	67102522	        19.96 ns/op	       0 B/op	       0 allocs/op
 BenchmarkConsistentAlwaysOn-10                                             	26184316	        45.24 ns/op	       0 B/op	       0 allocs/op
 BenchmarkComposableParentBasedUnknownThreshold-10                          	14998062	        72.46 ns/op	       0 B/op	       0 allocs/op
@@ -167,18 +164,6 @@ BenchmarkParentBasedWithOTelTraceStateIncludingRandomness-10               	2125
 ```
 
 ## Areas not explored
-
-### Export-only spans
-
-For this prototype, I wanted to explore a potential API change that
-would allow Samplers to indicate that spans should be exported even
-when the context is not sampled.
-
-This was explored, but not concluded.  One finding is that if the span
-is to be exported with a threshold in its tracestate, despite being
-unsampled, the Sampler needs a way to return or modify the tracestate
-attached to the span independent from the one it returns to the child
-context.
 
 ### Potential optimizations
 
@@ -194,4 +179,3 @@ to have one set of rules per span kind.  Similarly, composable sampler
 predicates could be pre-evaluated in terms of resource and scope
 attributes that are available, in order to lower the cost of sampler
 evaluation.
-
