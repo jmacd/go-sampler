@@ -34,9 +34,15 @@ func tracestateHasOTelField(otts string, search fieldSearchKey) (value string, s
 	} else {
 		return "", fieldPos{}, false
 	}
+
 	high := strings.IndexByte(otts[low:], ';')
+
 	if high < 0 {
+		// the field terminates at end-of-string
 		high = len(otts)
+	} else {
+		// add the offset used above in `otts[low:]`
+		high += low
 	}
 	start := low - 3
 	return otts[low:high], fieldPos{start: start, end: high}, true
@@ -131,9 +137,8 @@ func combineTracestate(original trace.TraceState, updateThreshold int64, thresho
 			_, _ = out.WriteString(unmodified[:start])
 			sections++
 		}
-		// If the th sub-key is not last, add 1 to add a separator.
+		// If the th sub-key is not last, [end:] includes a separator.
 		if end != len(unmodified) {
-			end--
 			_, _ = out.WriteString(unmodified[end:])
 			sections++
 		}
